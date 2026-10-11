@@ -1718,7 +1718,9 @@ describe("Temp Cleanup Resilience", () => {
           const fs = require('fs');
           const path = require('path');
           for (let j = 0; j < 3; j++) {
-            fs.writeFileSync(path.join(process.cwd(), 'f' + j + '.tmp'), 'data');
+            // TMPDIR is the per-run sandbox, which cleanup must remove; cwd is the
+            // project root since #788, so writing there would litter the repository.
+            fs.writeFileSync(path.join(process.env.TMPDIR, 'f' + j + '.tmp'), 'data');
           }
           console.log("ok-${i}");
         `,
