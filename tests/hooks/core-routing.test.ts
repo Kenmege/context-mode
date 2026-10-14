@@ -1206,18 +1206,23 @@ describe("mcp-ready: PPID-independence (regression for #347)", () => {
 describe("mcp-ready: session scope", () => {
   const prevEmbedded = process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
   const prevScope = process.env.CONTEXT_MODE_MCP_READY_SCOPE;
-  let formatMcpReadinessSentinel: (pid: number, ancestors: number[] | null) => string;
-  let collectMcpSentinelAncestors: (
-    startPid: number,
-    readParent?: (pid: number) => number | null,
-  ) => number[] | null;
+  const prevSession = process.env.CLAUDE_CODE_SESSION_ID;
+  let formatMcpReadinessSentinel: (
+    pid: number,
+    parent: number | null | undefined,
+    session: string | null | undefined,
+  ) => string;
 
   beforeAll(async () => {
     // Importing src/server.ts calls main() unless this is set first.
     process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS = "1";
     const server = await import("../../src/server.js");
     formatMcpReadinessSentinel = server.formatMcpReadinessSentinel;
-    collectMcpSentinelAncestors = server.collectMcpSentinelAncestors;
+  });
+
+  beforeEach(() => {
+    // The suite may itself run inside a Claude Code session.
+    delete process.env.CLAUDE_CODE_SESSION_ID;
   });
 
   afterEach(() => {
@@ -1234,6 +1239,8 @@ describe("mcp-ready: session scope", () => {
     __setHookAncestorLookupForTests(null);
     if (prevScope === undefined) delete process.env.CONTEXT_MODE_MCP_READY_SCOPE;
     else process.env.CONTEXT_MODE_MCP_READY_SCOPE = prevScope;
+    if (prevSession === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
+    else process.env.CLAUDE_CODE_SESSION_ID = prevSession;
     if (prevEmbedded === undefined) delete process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
     else process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS = prevEmbedded;
   });
@@ -1242,26 +1249,29 @@ describe("mcp-ready: session scope", () => {
     writeFileSync(mcpSentinel, body);
   }
 
-  it("isMCPReady returns true when sentinel ancestors include the hook's parent (same session)", () => {
+  it("isMCPReady returns true when the sentinel's parent is one of the hook's ancestors", () => {
     __setHookAncestorLookupForTests(() => new Set([4242, 100]));
-    liveSentinel(`${process.pid}\nancestors=7,4242`);
+    liveSentinel(`${process.pid}\nparent=4242`);
+    expect(isMCPReady()).toBe(true);
+  });
+
+  it("isMCPReady returns true on a session id match without a process lookup", () => {
+    process.env.CLAUDE_CODE_SESSION_ID = "sess-a";
+    __setHookAncestorLookupForTests(() => {
+      throw new Error("a session match must not consult ancestry");
+    });
+    liveSentinel(`${process.pid}\nparent=999\nsession=sess-a`);
     expect(isMCPReady()).toBe(true);
   });
 
   it("isMCPReady returns false when the only live sentinel belongs to another session", () => {
-    __setHookAncestorLookupForTests(() => new Set([111, 222]));
-    liveSentinel(`${process.pid}\nancestors=333,444`);
+    // Hook of session A: its agent 4242 and a host app 900 that also runs
+    // session B. B's server names only its own agent, so the shared host
+    // never makes A look ready.
+    process.env.CLAUDE_CODE_SESSION_ID = "sess-a";
+    __setHookAncestorLookupForTests(() => new Set([4242, 900]));
+    liveSentinel(`${process.pid}\nparent=5151\nsession=sess-b`);
     expect(isMCPReady()).toBe(false);
-  });
-
-  it("isMCPReady returns true when the agent PID is at ancestor level 2 or 3 (wrapper depth)", () => {
-    __setHookAncestorLookupForTests(() => new Set([500, 800]));
-    // One wrapper: agent is the server's grandparent.
-    liveSentinel(`${process.pid}\nancestors=410,500`);
-    expect(isMCPReady()).toBe(true);
-    // Two wrappers: agent is the server's great-grandparent.
-    liveSentinel(`${process.pid}\nancestors=410,420,800`);
-    expect(isMCPReady()).toBe(true);
   });
 
   it("isMCPReady returns true for a legacy sentinel with only a PID line", () => {
@@ -1272,15 +1282,22 @@ describe("mcp-ready: session scope", () => {
     expect(isMCPReady()).toBe(true);
   });
 
+  it("isMCPReady returns true when a legacy sentinel sits beside another session's", () => {
+    __setHookAncestorLookupForTests(() => new Set([111]));
+    liveSentinel(`${process.pid}\nparent=333`);
+    createSentinel(process.ppid);
+    expect(isMCPReady()).toBe(true);
+  });
+
   it("isMCPReady returns true when hook ancestry is unavailable and a live sentinel exists", () => {
     __setHookAncestorLookupForTests(() => null);
-    liveSentinel(`${process.pid}\nancestors=333,444`);
+    liveSentinel(`${process.pid}\nparent=333`);
     expect(isMCPReady()).toBe(true);
   });
 
   it("CONTEXT_MODE_MCP_READY_SCOPE=global restores any-sentinel readiness", () => {
     __setHookAncestorLookupForTests(() => new Set([111]));
-    liveSentinel(`${process.pid}\nancestors=333,444`);
+    liveSentinel(`${process.pid}\nparent=333`);
     expect(isMCPReady()).toBe(false);
     process.env.CONTEXT_MODE_MCP_READY_SCOPE = "global";
     __setHookAncestorLookupForTests(() => {
@@ -1289,57 +1306,26 @@ describe("mcp-ready: session scope", () => {
     expect(isMCPReady()).toBe(true);
   });
 
-  it("isMCPReady keeps today's result for a fresh unprobeable sentinel without ancestors (#844)", () => {
+  it("isMCPReady keeps today's result for a fresh unprobeable sentinel without owner lines (#844)", () => {
     try { unlinkSync(mcpSentinel); } catch { /* absent */ }
     __setHookAncestorLookupForTests(() => {
-      throw new Error("ancestry lookup must not run without an ancestors line");
+      throw new Error("ancestry lookup must not run without owner lines");
     });
     const path = createSentinel(DEAD_PID);
     expect(isMCPReady()).toBe(true);
     expect(existsSync(path)).toBe(true);
   });
 
-  it("server helper writes the PID first line and the ancestors line", () => {
-    const parents = new Map<number, number>([
-      [4321, 10],
-      [10, 20],
-      [20, 30],
-      [30, 1],
-    ]);
-    const body = formatMcpReadinessSentinel(
-      4321,
-      collectMcpSentinelAncestors(4321, (pid) => parents.get(pid) ?? null),
-    );
-    const lines = body.split("\n");
-    expect(lines[0]).toBe("4321");
+  it("server helper keeps the PID first and adds parent and session lines", () => {
+    const body = formatMcpReadinessSentinel(4321, 10, "abc-1");
+    expect(body).toBe("4321\nparent=10\nsession=abc-1");
     expect(parseInt(body, 10)).toBe(4321);
-    expect(lines[1]).toBe("ancestors=10,20,30");
-
-    const stopped = formatMcpReadinessSentinel(
-      4321,
-      collectMcpSentinelAncestors(4321, (pid) => (pid === 4321 ? 10 : 1)),
-    );
-    expect(stopped).toBe("4321\nancestors=10");
   });
 
-  it("server helper omits the ancestors line on error", () => {
-    expect(formatMcpReadinessSentinel(
-      4321,
-      collectMcpSentinelAncestors(4321, () => null),
-    )).toBe("4321");
-    expect(formatMcpReadinessSentinel(
-      4321,
-      collectMcpSentinelAncestors(4321, () => {
-        throw new Error("ps failed");
-      }),
-    )).toBe("4321");
-    const original = process.platform;
-    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-    try {
-      expect(formatMcpReadinessSentinel(99, collectMcpSentinelAncestors(99))).toBe("99");
-    } finally {
-      Object.defineProperty(process, "platform", { value: original, configurable: true });
-    }
+  it("server helper omits unusable owner values", () => {
+    expect(formatMcpReadinessSentinel(4321, 1, undefined)).toBe("4321");
+    expect(formatMcpReadinessSentinel(4321, null, "")).toBe("4321");
+    expect(formatMcpReadinessSentinel(4321, 10, "x\nparent=1")).toBe("4321\nparent=10");
   });
 });
 

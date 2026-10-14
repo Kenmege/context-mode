@@ -2,10 +2,11 @@
  * MCP readiness sentinel — checks if MCP server has started.
  *
  * Server writes sentinel (containing its PID) after connect().
- * Hooks scan live sentinels. A sentinel with an ancestors line counts only
- * when one of those PIDs is in this hook's own ancestor set, so another
- * session's server does not make this session look ready. PID-only sentinels
- * keep the any-live result (#347).
+ * Hooks scan live sentinels. A sentinel that names its owner counts only when
+ * its `session=` equals this hook's CLAUDE_CODE_SESSION_ID or its `parent=`
+ * (the agent that spawned the server) is one of this hook's ancestors, so
+ * another session's server does not make this session look ready. PID-only
+ * sentinels keep the any-live result (#347).
  *
  * Fix for #347: Claude Code spawns hooks via `bash -c "node ..."` on Linux/WSL2.
  * The intermediate shell makes process.ppid point to a transient bash PID, not
@@ -62,24 +63,24 @@ export function sentinelPath() {
 const HOOK_ANCESTOR_DEPTH = 12;
 
 /**
- * Optional `ancestors=` line. `null` when the line is absent (legacy sentinel).
- * An empty array means the line is present but lists no pids.
+ * Optional owner lines after the PID: `parent=<agent pid>` and
+ * `session=<CLAUDE_CODE_SESSION_ID>`. Both null for a legacy sentinel.
  */
-function parseSentinelAncestors(raw) {
+function parseSentinelOwner(raw) {
+  let parent = null;
+  let session = null;
   const lines = String(raw).split("\n");
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
-    if (!line.startsWith("ancestors=")) continue;
-    const rest = line.slice("ancestors=".length);
-    if (rest.length === 0) return [];
-    const ancestors = [];
-    for (const part of rest.split(",")) {
-      const n = parseInt(part.trim(), 10);
-      if (!isNaN(n)) ancestors.push(n);
+    if (line.startsWith("parent=")) {
+      const n = parseInt(line.slice("parent=".length), 10);
+      if (Number.isInteger(n) && n > 1) parent = n;
+    } else if (line.startsWith("session=")) {
+      const value = line.slice("session=".length);
+      if (value.length > 0) session = value;
     }
-    return ancestors;
   }
-  return null;
+  return { parent, session };
 }
 
 function splitFields(line) {
@@ -218,9 +219,11 @@ function sentinelIsLive(pid, fullPath, now) {
  *
  * `CONTEXT_MODE_MCP_READY_SCOPE=global` keeps the historical any-live-sentinel
  * result for hosts that spawn the server outside the agent process tree.
- * Otherwise a sentinel's `ancestors=` pids must intersect this hook's ancestor
- * set. Legacy sentinels (no ancestors line) and a failed ancestry lookup stay
- * on the historical result so older servers keep redirecting.
+ * Otherwise a sentinel counts when its `session=` matches this hook's
+ * CLAUDE_CODE_SESSION_ID (no process lookup needed) or its `parent=` is one of
+ * this hook's ancestors. Legacy sentinels (no owner lines) and a failed
+ * ancestry lookup stay on the historical result so older servers keep
+ * redirecting.
  */
 export function isMCPReady() {
   try {
@@ -247,39 +250,28 @@ export function isMCPReady() {
     }
     if (liveRaw.length === 0) return false;
 
-    const parsed = [];
-    let carriesAncestors = false;
-    for (const raw of liveRaw) {
-      const ancestors = parseSentinelAncestors(raw);
-      parsed.push(ancestors);
-      if (ancestors !== null) carriesAncestors = true;
-    }
-    // No ancestors lines → do not spawn ps. Historical any-live result.
-    if (!carriesAncestors) return true;
+    const owners = liveRaw.map(parseSentinelOwner);
+    const isLegacy = (o) => o.parent === null && o.session === null;
+    // No owner lines → do not spawn ps. Historical any-live result.
+    if (owners.every(isLegacy)) return true;
 
-    let hookAncestors;
-    try {
-      hookAncestors = hookAncestorLookup();
-    } catch {
-      hookAncestors = null;
-    }
-    // Lookup unavailable → historical any-live result.
-    if (hookAncestors == null) return true;
+    const hookSession = process.env.CLAUDE_CODE_SESSION_ID;
+    if (hookSession && owners.some((o) => o.session === hookSession)) return true;
 
-    let anyLegacy = false;
-    for (const ancestors of parsed) {
-      if (ancestors === null) {
-        anyLegacy = true;
-        continue;
+    if (owners.some((o) => o.parent !== null)) {
+      let hookAncestors;
+      try {
+        hookAncestors = hookAncestorLookup();
+      } catch {
+        hookAncestors = null;
       }
-      for (const ancestorPid of ancestors) {
-        if (ancestorPid === 0 || ancestorPid === 1) continue;
-        if (hookAncestors.has(ancestorPid)) return true;
-      }
+      // Lookup unavailable → historical any-live result.
+      if (hookAncestors == null) return true;
+      if (owners.some((o) => o.parent !== null && hookAncestors.has(o.parent))) return true;
     }
-    // A legacy sentinel beside scoped ones still means "some server we cannot place".
-    if (anyLegacy) return true;
-    // Every live sentinel named its ancestors and none is ours.
+    // A legacy sentinel beside owned ones still means "some server we cannot place".
+    if (owners.some(isLegacy)) return true;
+    // Every live sentinel names an owner and none is this session.
     return false;
   } catch {
     return false;

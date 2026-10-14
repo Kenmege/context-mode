@@ -5311,80 +5311,26 @@ server.registerTool(
 // ─────────────────────────────────────────────────────────
 
 /**
- * ppid field from `/proc/<pid>/stat`. `comm` may contain spaces and
- * parentheses, so the parent pid is the token after the last `)`.
+ * Readiness sentinel body. Line 1 stays exactly the PID so older hooks'
+ * `parseInt` keeps working. `parent=` is the agent process that spawned this
+ * server and `session=` its CLAUDE_CODE_SESSION_ID when set. Hooks use them to
+ * tell their own session's server from another session's on the same machine.
+ * Only the direct parent is recorded: a grandparent is usually a host app
+ * (T3 Code, tmux, a pty host) shared by many sessions.
  */
-export function ppidFromProcStat(stat: string): number | null {
-  const close = stat.lastIndexOf(")");
-  if (close < 0) return null;
-  let i = close + 1;
-  while (i < stat.length && (stat[i] === " " || stat[i] === "\t")) i++;
-  while (i < stat.length && stat[i] !== " " && stat[i] !== "\t") i++;
-  while (i < stat.length && (stat[i] === " " || stat[i] === "\t")) i++;
-  let num = "";
-  while (i < stat.length && stat[i] >= "0" && stat[i] <= "9") {
-    num += stat[i];
-    i++;
+export function formatMcpReadinessSentinel(
+  pid: number,
+  parent: number | null | undefined,
+  session: string | null | undefined,
+): string {
+  const lines = [String(pid)];
+  if (typeof parent === "number" && Number.isInteger(parent) && parent > 1) {
+    lines.push(`parent=${parent}`);
   }
-  if (num.length === 0) return null;
-  const n = parseInt(num, 10);
-  return Number.isFinite(n) ? n : null;
-}
-
-/** Parent pid via `/proc/<pid>/stat` (Linux) or `ps -o ppid= -p <pid>` (macOS). */
-export function readProcessParentPid(pid: number): number | null {
-  try {
-    if (process.platform === "linux") {
-      if (!Number.isInteger(pid) || pid <= 0) return null;
-      return ppidFromProcStat(readFileSync(`/proc/${pid}/stat`, "utf8"));
-    }
-    if (process.platform === "darwin") {
-      const result = spawnSync("ps", ["-o", "ppid=", "-p", String(pid)], {
-        encoding: "utf8",
-        timeout: 1000,
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-      if (result.error || result.status !== 0 || typeof result.stdout !== "string") return null;
-      const n = parseInt(result.stdout.trim(), 10);
-      return Number.isFinite(n) ? n : null;
-    }
-    return null;
-  } catch {
-    return null;
+  if (typeof session === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(session)) {
+    lines.push(`session=${session}`);
   }
-}
-
-/**
- * Parent, grandparent, and great-grandparent of `startPid`.
- * `null` means Windows or a lookup error — callers omit the ancestors line.
- * Stops before recording PID 1.
- */
-export function collectMcpSentinelAncestors(
-  startPid: number,
-  readParent: (pid: number) => number | null = readProcessParentPid,
-): number[] | null {
-  const ancestors: number[] = [];
-  let pid = startPid;
-  for (let depth = 0; depth < 3; depth++) {
-    let parent: number | null;
-    try {
-      parent = readParent(pid);
-    } catch {
-      return null;
-    }
-    if (typeof parent !== "number" || !Number.isInteger(parent) || parent <= 0) return null;
-    if (parent === 1) return ancestors;
-    ancestors.push(parent);
-    pid = parent;
-  }
-  return ancestors;
-}
-
-/** First line is exactly the server PID so `parseInt` on older hooks still works. */
-export function formatMcpReadinessSentinel(pid: number, ancestors: number[] | null): string {
-  const first = String(pid);
-  if (!Array.isArray(ancestors)) return first;
-  return `${first}\nancestors=${ancestors.join(",")}`;
+  return lines.join("\n");
 }
 
 async function main() {
@@ -5441,16 +5387,13 @@ async function main() {
     transport as unknown as { onmessage?: (message: unknown, extra?: unknown) => unknown },
   );
 
-  // Write MCP readiness sentinel (#230). Ancestors are collected once.
-  // The #844 refresh rewrites the same bytes so the mtime moves without
-  // spawning `ps` again. One writeFileSync, same as before.
-  let sentinelBody = String(process.pid);
-  try {
-    sentinelBody = formatMcpReadinessSentinel(
-      process.pid,
-      collectMcpSentinelAncestors(process.pid),
-    );
-  } catch { /* PID-only: readers fall back to any-live behaviour */ }
+  // Write MCP readiness sentinel (#230). The #844 refresh rewrites the same
+  // bytes so only the mtime moves.
+  const sentinelBody = formatMcpReadinessSentinel(
+    process.pid,
+    process.ppid,
+    process.env.CLAUDE_CODE_SESSION_ID,
+  );
   try { writeFileSync(mcpSentinel, sentinelBody); } catch { /* best effort */ }
 
   // #844: refresh the sentinel mtime while the server is alive so readiness
