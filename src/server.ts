@@ -5310,6 +5310,83 @@ server.registerTool(
 // Server startup
 // ─────────────────────────────────────────────────────────
 
+/**
+ * ppid field from `/proc/<pid>/stat`. `comm` may contain spaces and
+ * parentheses, so the parent pid is the token after the last `)`.
+ */
+export function ppidFromProcStat(stat: string): number | null {
+  const close = stat.lastIndexOf(")");
+  if (close < 0) return null;
+  let i = close + 1;
+  while (i < stat.length && (stat[i] === " " || stat[i] === "\t")) i++;
+  while (i < stat.length && stat[i] !== " " && stat[i] !== "\t") i++;
+  while (i < stat.length && (stat[i] === " " || stat[i] === "\t")) i++;
+  let num = "";
+  while (i < stat.length && stat[i] >= "0" && stat[i] <= "9") {
+    num += stat[i];
+    i++;
+  }
+  if (num.length === 0) return null;
+  const n = parseInt(num, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Parent pid via `/proc/<pid>/stat` (Linux) or `ps -o ppid= -p <pid>` (macOS). */
+export function readProcessParentPid(pid: number): number | null {
+  try {
+    if (process.platform === "linux") {
+      if (!Number.isInteger(pid) || pid <= 0) return null;
+      return ppidFromProcStat(readFileSync(`/proc/${pid}/stat`, "utf8"));
+    }
+    if (process.platform === "darwin") {
+      const result = spawnSync("ps", ["-o", "ppid=", "-p", String(pid)], {
+        encoding: "utf8",
+        timeout: 1000,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      if (result.error || result.status !== 0 || typeof result.stdout !== "string") return null;
+      const n = parseInt(result.stdout.trim(), 10);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parent, grandparent, and great-grandparent of `startPid`.
+ * `null` means Windows or a lookup error — callers omit the ancestors line.
+ * Stops before recording PID 1.
+ */
+export function collectMcpSentinelAncestors(
+  startPid: number,
+  readParent: (pid: number) => number | null = readProcessParentPid,
+): number[] | null {
+  const ancestors: number[] = [];
+  let pid = startPid;
+  for (let depth = 0; depth < 3; depth++) {
+    let parent: number | null;
+    try {
+      parent = readParent(pid);
+    } catch {
+      return null;
+    }
+    if (typeof parent !== "number" || !Number.isInteger(parent) || parent <= 0) return null;
+    if (parent === 1) return ancestors;
+    ancestors.push(parent);
+    pid = parent;
+  }
+  return ancestors;
+}
+
+/** First line is exactly the server PID so `parseInt` on older hooks still works. */
+export function formatMcpReadinessSentinel(pid: number, ancestors: number[] | null): string {
+  const first = String(pid);
+  if (!Array.isArray(ancestors)) return first;
+  return `${first}\nancestors=${ancestors.join(",")}`;
+}
+
 async function main() {
   // Clean up stale DB files from previous sessions
   const cleaned = cleanupStaleDBs();
@@ -5364,8 +5441,17 @@ async function main() {
     transport as unknown as { onmessage?: (message: unknown, extra?: unknown) => unknown },
   );
 
-  // Write MCP readiness sentinel (#230)
-  try { writeFileSync(mcpSentinel, String(process.pid)); } catch { /* best effort */ }
+  // Write MCP readiness sentinel (#230). Ancestors are collected once.
+  // The #844 refresh rewrites the same bytes so the mtime moves without
+  // spawning `ps` again. One writeFileSync, same as before.
+  let sentinelBody = String(process.pid);
+  try {
+    sentinelBody = formatMcpReadinessSentinel(
+      process.pid,
+      collectMcpSentinelAncestors(process.pid),
+    );
+  } catch { /* PID-only: readers fall back to any-live behaviour */ }
+  try { writeFileSync(mcpSentinel, sentinelBody); } catch { /* best effort */ }
 
   // #844: refresh the sentinel mtime while the server is alive so readiness
   // probes from a foreign PID namespace (shared /tmp) can trust a recent
@@ -5373,7 +5459,7 @@ async function main() {
   // freshness window is 90s (hooks/core/mcp-ready.mjs); refresh at 30s (3x).
   // unref() so this timer never keeps the event loop alive on its own.
   sentinelRefresh = setInterval(() => {
-    try { writeFileSync(mcpSentinel, String(process.pid)); } catch { /* best effort */ }
+    try { writeFileSync(mcpSentinel, sentinelBody); } catch { /* best effort */ }
   }, 30_000);
   sentinelRefresh.unref();
 
